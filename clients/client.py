@@ -3,6 +3,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 import torch
+import argparse
 from fl_core.model_def import get_model
 from clients.data_utils import get_dataloader
 from clients.training import train_local
@@ -132,8 +133,6 @@ def client_loop(client_id, dp_enabled=False, noise_multiplier=0.0, clip_norm=1.0
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Federated client with optional DP on updates")
     parser.add_argument("client_id", nargs="?", default="1", help="Client id string")
     parser.add_argument("--dp", action="store_true", help="Enable differential privacy (clip + noise)")
