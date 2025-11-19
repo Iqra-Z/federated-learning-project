@@ -1,0 +1,94 @@
+# ============================================================
+# FEDERATED LEARNING PROJECT - PYTHON DEPENDENCIES
+# ============================================================
+# Install with: pip install -r requirements.txt
+#
+# BREAKDOWN BY PURPOSE:
+#
+# 1. WEB FRAMEWORK (Server/API)
+# 2. MACHINE LEARNING (Model Training)
+# 3. DATA PROCESSING (Dataset Handling)
+# 4. HTTP CLIENT (Client-Server Communication)
+# ============================================================
+
+# ============================================================
+# 1. WEB FRAMEWORK - FastAPI Stack
+# ============================================================
+
+# FastAPI - Modern, fast web framework for building APIs
+# WHY: Creates REST API endpoints for client-server communication
+# EXAMPLE: @app.get("/get_model") creates an endpoint
+fastapi==0.104.1
+
+# Uvicorn - ASGI server to run FastAPI
+# WHY: FastAPI needs a server to actually run and accept requests
+# ANALOGY: FastAPI is a restaurant, Uvicorn is the building it runs in
+uvicorn[standard]==0.24.0
+
+# Pydantic - Data validation using Python type hints
+# WHY: Validates incoming data automatically (comes with FastAPI)
+# EXAMPLE: UpdateRequest(BaseModel) validates client submissions
+pydantic==2.5.0
+
+# ============================================================
+# 2. MACHINE LEARNING - PyTorch Stack
+# ============================================================
+
+# PyTorch - Deep learning framework
+# WHY: Used for defining, training, and evaluating neural networks
+# NOTE: This installs CPU version. For GPU: torch==2.1.0+cu118
+torch==2.1.0
+
+# TorchVision - Computer vision datasets and transforms
+# WHY: Provides MNIST dataset and image preprocessing
+# EXAMPLE: datasets.MNIST() loads the handwritten digits dataset
+torchvision==0.16.0
+
+# ============================================================
+# 3. DATA PROCESSING
+# ============================================================
+
+# NumPy - Numerical computing library
+# WHY: Array operations, data splitting, Dirichlet distribution
+# EXAMPLE: np.random.dirichlet() for non-IID data partitioning
+numpy==1.24.3
+
+# ============================================================
+# 4. HTTP CLIENT - For Client-Server Communication
+# ============================================================
+
+# Requests - HTTP library for making API calls
+# WHY: Clients use this to communicate with server
+# EXAMPLE: requests.post(f"{SERVER_URL}/submit_update", json=data)
+requests==2.31.0
+
+# ============================================================
+# OPTIONAL - DEVELOPMENT TOOLS (Uncomment if needed)
+# ============================================================
+
+# Pytest - Testing framework
+# pytest==7.4.3
+
+# Black - Code formatter
+# black==23.11.0
+
+# Flake8 - Linting tool
+# flake8==6.1.0
+
+# ============================================================
+# VERSION COMPATIBILITY NOTES
+# ============================================================
+#
+# Python Version: 3.8 - 3.11 recommended
+# - Python 3.12+ may have compatibility issues with some libraries
+#
+# PyTorch GPU Support:
+# - For CUDA 11.8: torch==2.1.0+cu118
+# - For CUDA 12.1: torch==2.1.0+cu121
+# - Install from: https://pytorch.org/get-started/locally/
+#
+# FastAPI Updates:
+# - These versions are stable as of Nov 2024
+# - Check for updates: pip list --outdated
+#
+# ============================================================
