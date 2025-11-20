@@ -17,7 +17,7 @@ A distributed machine learning system implementing **Federated Learning** to tra
 
 ---
 
-## 🎯 Overview
+##  Overview
 
 ### What is Federated Learning?
 
@@ -48,7 +48,7 @@ Federated Learning System that:
 
 ---
 
-## ✨ Features
+## Features
 
 ### Core Functionality
 - **Federated Averaging (FedAvg)**: Weighted aggregation of client updates
@@ -67,7 +67,7 @@ Federated Learning System that:
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 Visualization of the system architecture
 
@@ -129,7 +129,7 @@ Visualization of the system architecture
 
 ---
 
-## 📋 Prerequisites
+## Prerequisites
 
 ### Software Requirements
 
@@ -146,7 +146,7 @@ Visualization of the system architecture
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ### Step 1: Clone Repository
 
@@ -256,7 +256,7 @@ npm start
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 federated-learning-project/
@@ -292,7 +292,7 @@ federated-learning-project/
 
 ---
 
-## 👥 Team Members
+##  Team Members
 
 | Name | Role | Responsibilities |
 |------|------|------------------|
@@ -301,7 +301,7 @@ federated-learning-project/
 
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - **Instructor**: Dr. Khalid A. Hafeez
 - **Course**: SOFE4790U - Distributed Systems (Fall 2025)
