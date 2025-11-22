@@ -225,12 +225,8 @@ if __name__ == "__main__":
         help="Enable client-side debug prints (works with --dp)",
     )
     # options to control client-side data partitioning
-    parser.add_argument(
-        "--num-clients",
-        type=int,
-        default=10,
-        help="Total number of clients for splitting train data",
-    )
+    # num_clients removed from CLI to avoid mismatch with server config;
+    # client will fetch num_clients from server /config at startup.
     parser.add_argument(
         "--non-iid",
         action="store_true",
@@ -244,18 +240,28 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Always fetch num_clients from server config before printing split info
+    try:
+        cfg = requests.get(f"{SERVER_URL}/config").json()
+        num_clients = int(cfg.get("num_clients", 0)) or None
+        print(f"[CLIENT] Fetched num_clients={num_clients} from server config")
+    except Exception as e:
+        num_clients = None
+        print(f"[CLIENT] Failed to fetch server config: {e}. Falling back to default loader behavior")
+
+    num_clients_display = num_clients if num_clients is not None else "unknown"
     # print whether we're running IID or non-IID
     if args.non_iid:
         print(
-            f"[CLIENT] Running with non-IID Dirichlet split (num_clients={args.num_clients}, alpha={args.alpha})"
+            f"[CLIENT] Running with non-IID Dirichlet split (num_clients={num_clients_display}, alpha={args.alpha})"
         )
     else:
-        print(f"[CLIENT] Running with IID split (num_clients={args.num_clients})")
+        print(f"[CLIENT] Running with IID split (num_clients={num_clients_display})")
 
-    # If user requested per-client partitioning, create client loaders and pick the client's loader
-    if args.num_clients is not None:
+    if num_clients is not None:
         clients_loaders, _ = get_client_loaders(
-            num_clients=args.num_clients, iid=(not args.non_iid), alpha=args.alpha
+            num_clients=num_clients, iid=(not args.non_iid), alpha=args.alpha
         )
 
         # replace get_dataloader behavior by injecting local loader into client_loop via closure
@@ -272,10 +278,10 @@ if __name__ == "__main__":
                 cid = 0
             # pick loader for this client id
             train_loader = clients_loaders.get(cid, None)
-            # Validate requested client id
-            if cid < 0 or cid >= args.num_clients:
+            # Validate requested client id if server provided it
+            if num_clients is not None and (cid < 0 or cid >= num_clients):
                 print(
-                    f"[CLIENT] ERROR: client_id={cid} out of range for num_clients={args.num_clients}. Falling back to full loader."
+                    f"[CLIENT] ERROR: client_id={cid} out of range for num_clients={num_clients}. Falling back to full loader."
                 )
                 train_loader, _ = get_dataloader()
             else:
