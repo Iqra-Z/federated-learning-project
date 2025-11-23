@@ -42,14 +42,14 @@ training_history = []  # Store metrics: [{round, accuracy, loss, ...}, ...]
 # at least MIN_UPDATES_TO_AGGREGATE are available.
 PARTICIPATION_PROB = float(os.environ.get("FL_PARTICIPATION_PROB", 0.5))
 # Number of clients (default 3) can be overridden by environment variable
-NUM_CLIENTS = int(os.environ.get("FL_NUM_CLIENTS", 3))
+NUM_CLIENTS = int(os.environ.get("FL_NUM_CLIENTS", 4))
 MIN_UPDATES_TO_AGGREGATE = 1  # safety lower bound
 UPDATES_PER_ROUND = max(MIN_UPDATES_TO_AGGREGATE, ceil(PARTICIPATION_PROB * NUM_CLIENTS))
 
 # Aggregation timeout (seconds) - after this many seconds since the first
 # submission for a round, the server will aggregate with whatever updates it
 # has received to tolerate dropped clients.
-AGGREGATION_TIMEOUT = float(os.environ.get("FL_AGG_TIMEOUT", 30.0))
+AGGREGATION_TIMEOUT = float(os.environ.get("FL_AGG_TIMEOUT", 45.0))
 
 # Track when the first submission for a round arrived: round -> timestamp
 first_submission_time = {}
@@ -84,8 +84,8 @@ def select_participants_for_round(round_idx: int):
     if round_idx in selected_clients_by_round:
         return selected_clients_by_round[round_idx]
 
-    k = max(1, int(round(PARTICIPATION_PROB * NUM_CLIENTS)))
-    k = min(k, NUM_CLIENTS)
+    # Select exactly the target number of updates per round (bounded by NUM_CLIENTS)
+    k = max(1, min(UPDATES_PER_ROUND, NUM_CLIENTS))
     sampled = set(str(x) for x in random.sample(range(NUM_CLIENTS), k))
     selected_clients_by_round[round_idx] = sampled
     first_submission_time.setdefault(round_idx, time.time()) # Record when this participant set was chosen so timeout can be started
@@ -351,8 +351,9 @@ def _aggregation_monitor():
             if start_ts is not None:
                 elapsed = time.time() - start_ts
                 if elapsed >= AGGREGATION_TIMEOUT:
-                    # If we have updates, perform aggregation as before.
-                    if len(agg.updates) > 0:
+                    # Snapshot whether we have updates before attempting aggregation.
+                    had_updates = len(agg.updates) > 0
+                    if had_updates:
                         print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; aggregating {len(agg.updates)} updates")
                     else:
                         print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; no updates received -> advancing round")
@@ -367,9 +368,10 @@ def _aggregation_monitor():
                             "round": current,
                         }
 
+
                     # Force aggregation using whatever updates we've got (if any)
                     try:
-                        if len(agg.updates) > 0:
+                        if had_updates:
                             agg.aggregate()
                         else:
                             # No updates: explicitly advance the round so server liveness
@@ -392,7 +394,7 @@ def _aggregation_monitor():
                             pass
 
                     # Evaluate and record metrics only when we actually aggregated updates
-                    if len(agg.updates) == 0:
+                    if not had_updates:
                         # Empty round - record that it completed with no updates
                         print(f"[SERVER] (timeout) Round {finished_round} advanced with NO updates")
                     else:
