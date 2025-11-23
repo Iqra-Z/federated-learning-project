@@ -9,6 +9,8 @@ import torch  # PyTorch for model evaluation
 from fastapi import FastAPI  # Web framework for building APIs
 from fastapi.middleware.cors import CORSMiddleware  # Allow cross-origin requests
 from pydantic import BaseModel  # Data validation
+import threading
+import time
 
 # Add parent directory to Python path (for imports to work)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,6 +46,14 @@ NUM_CLIENTS = int(os.environ.get("FL_NUM_CLIENTS", 3))
 MIN_UPDATES_TO_AGGREGATE = 1  # safety lower bound
 UPDATES_PER_ROUND = max(MIN_UPDATES_TO_AGGREGATE, ceil(PARTICIPATION_PROB * NUM_CLIENTS))
 
+# Aggregation timeout (seconds) - after this many seconds since the first
+# submission for a round, the server will aggregate with whatever updates it
+# has received to tolerate dropped clients.
+AGGREGATION_TIMEOUT = float(os.environ.get("FL_AGG_TIMEOUT", 30.0))
+
+# Track when the first submission for a round arrived: round -> timestamp
+first_submission_time = {}
+
 # Deterministic per-round selection storage: round_index -> set(client_id_str)
 selected_clients_by_round = {}
 # Track which clients have already submitted for a given round: round_index -> set(client_id_str)
@@ -78,6 +88,7 @@ def select_participants_for_round(round_idx: int):
     k = min(k, NUM_CLIENTS)
     sampled = set(str(x) for x in random.sample(range(NUM_CLIENTS), k))
     selected_clients_by_round[round_idx] = sampled
+    first_submission_time.setdefault(round_idx, time.time()) # Record when this participant set was chosen so timeout can be started
     print(f"[SERVER] Selected {len(sampled)} participants for round {round_idx}: {sorted(list(sampled))}")
     return sampled
 
@@ -218,19 +229,26 @@ def submit_update(upd: UpdateRequest):
 
     # Check if ready to aggregate
     if len(agg.updates) >= UPDATES_PER_ROUND:
-        print(f"[SERVER] 🔄 Aggregating round {agg.current_round + 1}...")
+        # Log the round we're about to aggregate (current round)
+        print(f"[SERVER] 🔄 Aggregating round {agg.current_round}...")
 
         # Perform Federated Averaging (your partner's code)
         agg.aggregate()
 
-        # After successful aggregation for this round, clear submitted set for
-        # the previous round (they've been processed). The aggregator already
-        # incremented agg.current_round inside aggregate(), so remove entries
-        # for the round we just finished.
+        # After successful aggregation the aggregator increments agg.current_round.
+        # The 'finished' round is therefore agg.current_round - 1.
         finished_round = agg.current_round - 1
+
+        # Clear submitted set for the finished round (they've been processed).
         if finished_round in submitted_clients_by_round:
             try:
                 del submitted_clients_by_round[finished_round]
+            except KeyError:
+                pass
+        # Clean up selection/submission timestamp for finished round
+        if finished_round in first_submission_time:
+            try:
+                del first_submission_time[finished_round]
             except KeyError:
                 pass
 
@@ -243,10 +261,10 @@ def submit_update(upd: UpdateRequest):
         # Test the new model
         accuracy, loss = evaluate_model()
 
-        # Store metrics for dashboard
+        # Store metrics for dashboard using the finished round number for clarity
         training_history.append(
             {
-                "round": agg.current_round,
+                "round": finished_round,
                 "accuracy": accuracy,
                 "loss": loss,
                 "timestamp": datetime.now().isoformat(),
@@ -254,7 +272,7 @@ def submit_update(upd: UpdateRequest):
         )
 
         print(
-            f"[SERVER] ✅ Round {agg.current_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}"
+            f"[SERVER] ✅ Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}"
         )
 
         return {
@@ -317,8 +335,91 @@ def get_config():
         "num_clients": NUM_CLIENTS,
         "participation_prob": PARTICIPATION_PROB,
         "updates_per_round": UPDATES_PER_ROUND,
+        "aggregation_timeout": AGGREGATION_TIMEOUT,
         "current_round": agg.current_round,
     }
+
+
+# Background monitor: checks if the current round has been waiting too long
+# after the first submission and forces aggregation with available updates.
+def _aggregation_monitor():
+    while True:
+        try:
+            current = agg.current_round
+            start_ts = first_submission_time.get(current, None)
+            # If we have a start time and enough time has passed, trigger aggregation
+            if start_ts is not None:
+                elapsed = time.time() - start_ts
+                if elapsed >= AGGREGATION_TIMEOUT:
+                    # If we have updates, perform aggregation as before.
+                    if len(agg.updates) > 0:
+                        print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; aggregating {len(agg.updates)} updates")
+                    else:
+                        print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; no updates received -> advancing round")
+                    # mark selected-but-not-submitted clients as timed_out for diagnostics
+                    selected = selected_clients_by_round.get(current, set())
+                    submitted = submitted_clients_by_round.get(current, set())
+                    missing = selected - submitted
+                    for cid in missing:
+                        clients_status[cid] = {
+                            "status": "timed_out",
+                            "timestamp": datetime.now().isoformat(),
+                            "round": current,
+                        }
+
+                    # Force aggregation using whatever updates we've got (if any)
+                    try:
+                        if len(agg.updates) > 0:
+                            agg.aggregate()
+                        else:
+                            # No updates: explicitly advance the round so server liveness
+                            # is preserved. We skip model evaluation for empty rounds.
+                            agg.current_round += 1
+                    except Exception as e:
+                        print(f"[SERVER] Forced aggregation/advance failed: {e}")
+
+                    # cleanup bookkeeping for finished round
+                    finished_round = agg.current_round - 1
+                    if finished_round in submitted_clients_by_round:
+                        try:
+                            del submitted_clients_by_round[finished_round]
+                        except KeyError:
+                            pass
+                    if finished_round in first_submission_time:
+                        try:
+                            del first_submission_time[finished_round]
+                        except KeyError:
+                            pass
+
+                    # Evaluate and record metrics only when we actually aggregated updates
+                    if len(agg.updates) == 0:
+                        # Empty round - record that it completed with no updates
+                        print(f"[SERVER] (timeout) Round {finished_round} advanced with NO updates")
+                    else:
+                        try:
+                            accuracy, loss = evaluate_model()
+                            training_history.append(
+                                {
+                                    "round": finished_round,
+                                    "accuracy": accuracy,
+                                    "loss": loss,
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                            )
+                            print(f"[SERVER] \u2705 (timeout) Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}")
+                        except Exception as e:
+                            print(f"[SERVER] Post-aggregation evaluation failed: {e}")
+
+            # Sleep briefly between checks
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"[SERVER] Aggregation monitor error: {e}")
+            time.sleep(1.0)
+
+
+# Start monitor thread as daemon so it doesn't block shutdown
+monitor_thread = threading.Thread(target=_aggregation_monitor, daemon=True)
+monitor_thread.start()
 
 
 # ============ HELPER FUNCTIONS ============
