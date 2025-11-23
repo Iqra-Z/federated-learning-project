@@ -1,87 +1,95 @@
-import React, { useState, useEffect } from "react";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-} from "recharts";
+import React, { useState, useEffect, useRef } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import './App.css';
 
-const SERVER_URL = "http://127.0.0.1:9000";
+const SERVER_URL = 'http://127.0.0.1:9000';
 
 function App() {
-  // ============================================================
-  // STATE - Data that triggers re-renders when changed
-  // ============================================================
-
-  // System status: rounds, clients, pending updates
   const [status, setStatus] = useState({
     current_round: 0,
     active_clients: 0,
     pending_updates: 0,
     clients: {},
     history: [],
+    connected_clients: [],
+    aggregation_in_progress: false
   });
-
-  // Training metrics: accuracy and loss arrays
+  
   const [metrics, setMetrics] = useState({
     rounds: [],
     accuracy: [],
     loss: [],
+    last_updated: null
   });
-
-  // UI state: loading and error handling
+  
+  const [config, setConfig] = useState({
+    num_clients: 0,
+    participation_prob: 0.5,
+    updates_per_round: 2,
+    aggregation_timeout: 45,
+    current_round: 0,
+    connected_clients: 0
+  });
+  
+  const [selectedClient, setSelectedClient] = useState(null);
+  const [clientHistory, setClientHistory] = useState([]);
+  const [roundDetails, setRoundDetails] = useState({});
+  
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [lastUpdate, setLastUpdate] = useState(null);
+  
+  // Track last metrics update to prevent unnecessary re-renders
+  const lastMetricsUpdate = useRef(null);
 
   useEffect(() => {
-    // Fetch immediately on mount
     fetchStatus();
     fetchMetrics();
-
-    // Set up polling (fetch every X seconds)
-    const statusInterval = setInterval(fetchStatus, 2000); // Every 2s
-    const metricsInterval = setInterval(fetchMetrics, 5000); // Every 5s
-
-    // Cleanup when component unmounts
+    fetchConfig();
+    
+    const statusInterval = setInterval(fetchStatus, 2000);
+    const metricsInterval = setInterval(fetchMetricsIfNeeded, 3000);
+    const configInterval = setInterval(fetchConfig, 5000);
+    
     return () => {
       clearInterval(statusInterval);
       clearInterval(metricsInterval);
+      clearInterval(configInterval);
     };
-  }, []); // Empty array = run once on mount
-
-  // ============================================================
-  // FETCH FUNCTIONS - Async/Await for HTTP Requests
-  // ============================================================
-
+  }, []);
+  
   const fetchStatus = async () => {
     try {
-      // Send GET request to server
       const response = await fetch(`${SERVER_URL}/status`);
-
-      // Check if request succeeded (status 200)
-      if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
-      }
-
-      // Parse JSON response
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+      
       const data = await response.json();
-
-      // Update state (triggers re-render)
       setStatus(data);
-      setLastUpdate(new Date());
       setIsLoading(false);
       setError(null);
+      
     } catch (err) {
-      console.error("Failed to fetch status:", err);
+      console.error('Failed to fetch status:', err);
       setError(err.message);
       setIsLoading(false);
+    }
+  };
+
+  const fetchMetricsIfNeeded = async () => {
+    try {
+      const response = await fetch(`${SERVER_URL}/metrics`);
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+      
+      const data = await response.json();
+      
+      // Only update if last_updated timestamp changed (new round completed)
+      if (data.last_updated !== lastMetricsUpdate.current) {
+        setMetrics(data);
+        lastMetricsUpdate.current = data.last_updated;
+        console.log("📊 Metrics updated after round completion");
+      }
+      
+    } catch (err) {
+      console.error('Failed to fetch metrics:', err);
     }
   };
 
@@ -89,653 +97,424 @@ function App() {
     try {
       const response = await fetch(`${SERVER_URL}/metrics`);
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
-
+      
       const data = await response.json();
       setMetrics(data);
+      lastMetricsUpdate.current = data.last_updated;
+      
     } catch (err) {
-      console.error("Failed to fetch metrics:", err);
+      console.error('Failed to fetch metrics:', err);
     }
   };
 
-  // ============================================================
-  // DATA TRANSFORMATION - Prepare data for charts
-  // ============================================================
+  const fetchConfig = async () => {
+    try {
+      const response = await fetch(`${SERVER_URL}/config`);
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+      
+      const data = await response.json();
+      setConfig(data);
+      
+    } catch (err) {
+      console.error('Failed to fetch config:', err);
+    }
+  };
 
-  /*
-  RECHARTS needs data as array of objects:
-  [
-    {round: 1, accuracy: 85, loss: 0.45},
-    {round: 2, accuracy: 88, loss: 0.38},
-    ...
-  ]
+  const fetchClientHistory = async (clientId) => {
+    try {
+      const response = await fetch(`${SERVER_URL}/client_history/${clientId}`);
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+      
+      const data = await response.json();
+      setClientHistory(data.history);
+      setSelectedClient(clientId);
+      
+    } catch (err) {
+      console.error('Failed to fetch client history:', err);
+    }
+  };
 
-  We have parallel arrays from server:
-  - rounds: [1, 2, 3]
-  - accuracy: [0.85, 0.88, 0.91]
-  - loss: [0.45, 0.38, 0.32]
+  const fetchRoundDetails = async (roundNum) => {
+    try {
+      const response = await fetch(`${SERVER_URL}/round_details/${roundNum}`);
+      if (!response.ok) return;
+      
+      const data = await response.json();
+      setRoundDetails(prev => ({ ...prev, [roundNum]: data }));
+      
+    } catch (err) {
+      console.error('Failed to fetch round details:', err);
+    }
+  };
 
-  ZIP them together using .map():
-  */
-  const chartData = metrics.rounds.map((round, idx) => ({
-    round,
-    accuracy: parseFloat((metrics.accuracy[idx] * 100).toFixed(2)),
-    loss: parseFloat(metrics.loss[idx].toFixed(4)),
-  }));
+  // Fetch round details for displayed rounds
+  useEffect(() => {
+    if (status.history && status.history.length > 0) {
+      status.history.forEach(h => {
+        if (!roundDetails[h.round]) {
+          fetchRoundDetails(h.round);
+        }
+      });
+    }
+  }, [status.history]);
 
-  // Latest accuracy (for display)
-  const latestAccuracy =
-    chartData.length > 0 ? chartData[chartData.length - 1].accuracy : 0;
+  // Data processing - stable, only updates when metrics change
+  const accuracyData = (metrics.rounds && metrics.rounds.length > 0) 
+    ? metrics.rounds.map((round, idx) => ({
+        round,
+        accuracy: parseFloat((metrics.accuracy[idx] * 100).toFixed(2))
+      }))
+    : [];
 
-  // ============================================================
-  // LOADING & ERROR STATES
-  // ============================================================
+  const lossData = (metrics.rounds && metrics.rounds.length > 0)
+    ? metrics.rounds.map((round, idx) => ({
+        round,
+        loss: parseFloat((metrics.loss[idx] || 0).toFixed(4))
+      }))
+    : [];
 
-  // Show loading screen while fetching initial data
+  const latestAccuracy = accuracyData.length > 0 
+    ? accuracyData[accuracyData.length - 1].accuracy 
+    : 0;
+
+  const clientsByStatus = groupClientsByStatus(status.clients);
+  const timedOutCount = clientsByStatus['timed_out']?.length || 0;
+
   if (isLoading) {
     return (
-      <div style={styles.loadingContainer}>
-        <div style={styles.spinner}>⏳</div>
-        <div style={styles.loadingText}>Connecting to server...</div>
+      <div className="loading-container">
+        <div className="spinner">⏳</div>
+        <div className="loading-text">Connecting to server...</div>
       </div>
     );
   }
-
-  // Show error screen if connection failed
+  
   if (error) {
     return (
-      <div style={styles.errorContainer}>
+      <div className="error-container">
         <h2>❌ Connection Error</h2>
-        <p>
-          <strong>Could not connect to server:</strong> {error}
-        </p>
+        <p><strong>Could not connect to server:</strong> {error}</p>
         <p>Make sure the server is running:</p>
-        <code style={styles.codeBlock}>python server/main.py</code>
+        <code className="code-block">python server/main.py</code>
       </div>
     );
   }
 
-  // ============================================================
-  // MAIN RENDER - Dashboard UI
-  // ============================================================
-
   return (
-    <div style={styles.container}>
-      {/* Header with gradient */}
-      <div style={styles.header}>
-        <h1 style={styles.title}>
-          <span style={styles.emoji}>🤖</span> Federated Learning Dashboard
+    <div className="container">
+      
+      {/* Header */}
+      <div className="header">
+        <h1 className="title">
+          <span className="emoji">🤖</span> Federated Learning Dashboard
         </h1>
-        <div style={styles.subtitle}>
-          Real-time Distributed Machine Learning Visualization
+        <div className="subtitle">
+          Real-time Distributed ML Monitoring
+          {status.aggregation_in_progress && <span className="aggregating"> • Aggregating...</span>}
         </div>
-        {lastUpdate && (
-          <div style={styles.lastUpdate}>
-            Last updated: {lastUpdate.toLocaleTimeString()}
-          </div>
-        )}
       </div>
-
-      {/* Top Stats Row - 4 cards */}
-      <div style={styles.statsGrid}>
-        <StatCard
-          title="Current Round"
-          value={status.current_round}
+      
+      {/* Top Stats */}
+      <div className="stats-grid">
+        <StatCard 
+          title="Round" 
+          value={status.current_round} 
           color="#4CAF50"
           icon="🔄"
-          subtitle="Training iterations"
         />
-        <StatCard
-          title="Active Clients"
-          value={status.active_clients}
+        <StatCard 
+          title="Connected" 
+          value={config.connected_clients} 
           color="#2196F3"
           icon="📱"
-          subtitle="Edge devices"
         />
-        <StatCard
-          title="Pending Updates"
-          value={status.pending_updates}
+        <StatCard 
+          title="Participation" 
+          value={`${(config.participation_prob * 100).toFixed(0)}%`}
           color="#FF9800"
-          icon="⏳"
-          subtitle="Awaiting aggregation"
+          icon="🎲"
         />
-        <StatCard
-          title="Model Accuracy"
-          value={`${latestAccuracy.toFixed(1)}%`}
+        <StatCard 
+          title="Accuracy" 
+          value={`${latestAccuracy.toFixed(1)}%`} 
           color="#9C27B0"
           icon="🎯"
-          subtitle="Test set performance"
         />
       </div>
 
-      {/* Charts Row - Two charts side by side */}
-      <div style={styles.chartsGrid}>
-        {/* Accuracy Chart - Area Chart */}
-        <ChartCard title="📈 Model Accuracy Over Rounds" color="#4CAF50">
-          {chartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={chartData}>
-                <defs>
-                  <linearGradient
-                    id="colorAccuracy"
-                    x1="0"
-                    y1="0"
-                    x2="0"
-                    y2="1"
-                  >
-                    <stop offset="5%" stopColor="#4CAF50" stopOpacity={0.8} />
-                    <stop offset="95%" stopColor="#4CAF50" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                <XAxis
-                  dataKey="round"
-                  label={{
-                    value: "Round",
-                    position: "insideBottom",
-                    offset: -5,
-                  }}
-                  stroke="#666"
-                />
-                <YAxis
-                  label={{
-                    value: "Accuracy (%)",
-                    angle: -90,
-                    position: "insideLeft",
-                  }}
-                  domain={[0, 100]}
-                  stroke="#666"
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "#fff",
-                    border: "1px solid #ddd",
-                    borderRadius: "4px",
-                  }}
-                  formatter={(value) => `${value}%`}
-                />
-                <Legend />
-                <Area
-                  type="monotone"
-                  dataKey="accuracy"
-                  stroke="#4CAF50"
-                  fillOpacity={1}
-                  fill="url(#colorAccuracy)"
-                  strokeWidth={3}
-                  name="Accuracy (%)"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : (
-            <EmptyState message="Waiting for training data..." icon="📊" />
-          )}
-        </ChartCard>
-
-        {/* Loss Chart - Line Chart */}
-        <ChartCard title="📉 Training Loss Over Rounds" color="#F44336">
-          {chartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                <XAxis
-                  dataKey="round"
-                  label={{
-                    value: "Round",
-                    position: "insideBottom",
-                    offset: -5,
-                  }}
-                  stroke="#666"
-                />
-                <YAxis
-                  label={{ value: "Loss", angle: -90, position: "insideLeft" }}
-                  stroke="#666"
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "#fff",
-                    border: "1px solid #ddd",
-                    borderRadius: "4px",
-                  }}
-                  formatter={(value) => value.toFixed(4)}
-                />
-                <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="loss"
-                  stroke="#F44336"
-                  strokeWidth={3}
-                  dot={{ r: 5, fill: "#F44336" }}
-                  activeDot={{ r: 8 }}
-                  name="Cross-Entropy Loss"
-                />
+      {/* Charts Row - Only updates after round completion */}
+      <div className="charts-grid">
+        
+        {/* Accuracy Chart */}
+        <div className="chart-card">
+          <h2 className="card-title">📈 Model Accuracy</h2>
+          {accuracyData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={accuracyData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="round" label={{ value: 'Round', position: 'insideBottom', offset: -5 }} />
+                <YAxis domain={[0, 100]} label={{ value: 'Accuracy (%)', angle: -90, position: 'insideLeft' }} />
+                <Tooltip formatter={(value) => `${value}%`} />
+                <Line type="monotone" dataKey="accuracy" stroke="#4CAF50" strokeWidth={2} dot={{ r: 4 }} />
               </LineChart>
             </ResponsiveContainer>
           ) : (
-            <EmptyState message="Waiting for training data..." icon="📊" />
+            <EmptyState message="Waiting for training data..." />
           )}
-        </ChartCard>
+        </div>
+        
+        {/* Loss Chart */}
+        <div className="chart-card">
+          <h2 className="card-title">📉 Training Loss</h2>
+          {lossData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={lossData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="round" label={{ value: 'Round', position: 'insideBottom', offset: -5 }} />
+                <YAxis label={{ value: 'Loss', angle: -90, position: 'insideLeft' }} />
+                <Tooltip formatter={(value) => value.toFixed(4)} />
+                <Line type="monotone" dataKey="loss" stroke="#F44336" strokeWidth={2} dot={{ r: 4 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyState message="Waiting for training data..." />
+          )}
+        </div>
       </div>
 
       {/* Active Clients Table */}
-      <div style={styles.tableCard}>
-        <h2 style={styles.cardTitle}>
-          📊 Active Clients
-          <span style={styles.badge}>
-            {Object.keys(status.clients).length} connected
-          </span>
+      <div className="table-card">
+        <h2 className="card-title">
+          👥 Connected Clients
+          <span className="badge">{Object.keys(status.clients).length}</span>
         </h2>
-
+        
         {Object.keys(status.clients).length === 0 ? (
-          <EmptyState
-            message="No clients connected yet. Start some clients to see them here!"
-            icon="🤖"
-          />
+          <EmptyState message="No clients connected. Start clients to see them here." />
         ) : (
-          <div style={styles.tableWrapper}>
-            <table style={styles.table}>
+          <div className="table-wrapper">
+            <table className="table">
               <thead>
-                <tr style={styles.tableHeader}>
-                  <th style={styles.th}>Client ID</th>
-                  <th style={styles.th}>Status</th>
-                  <th style={styles.th}>Data Size</th>
-                  <th style={styles.th}>Round</th>
-                  <th style={styles.th}>Last Update</th>
+                <tr>
+                  <th>Client ID</th>
+                  <th>Status</th>
+                  <th>Data Size</th>
+                  <th>Round</th>
+                  <th>Last Activity</th>
+                  <th>History</th>
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(status.clients).map(
-                  ([clientId, clientInfo]) => (
-                    <tr key={clientId} style={styles.tableRow}>
-                      <td style={styles.td}>
-                        <span
-                          style={{
-                            ...styles.clientBadge,
-                            backgroundColor: "#4CAF50",
-                          }}
-                        >
-                          Client {clientId}
-                        </span>
+                {Object.entries(status.clients)
+                  .sort((a, b) => {
+                    const idA = parseInt(a[0]) || 0;
+                    const idB = parseInt(b[0]) || 0;
+                    return idA - idB;
+                  })
+                  .map(([clientId, clientInfo]) => (
+                    <tr key={clientId}>
+                      <td>
+                        <span className="client-badge">Client {clientId}</span>
                       </td>
-                      <td style={styles.td}>
+                      <td>
                         <StatusBadge status={clientInfo.status} />
                       </td>
-                      <td style={styles.td}>
-                        <strong>{clientInfo.data_size.toLocaleString()}</strong>{" "}
-                        samples
+                      <td>
+                        {clientInfo.data_size 
+                          ? `${clientInfo.data_size.toLocaleString()} samples`
+                          : 'N/A'
+                        }
                       </td>
-                      <td style={styles.td}>
-                        <span style={styles.roundBadge}>
-                          Round {clientInfo.round}
-                        </span>
+                      <td>
+                        <span className="round-badge">Round {clientInfo.round}</span>
                       </td>
-                      <td style={styles.td}>
+                      <td className="timestamp">
                         {new Date(clientInfo.timestamp).toLocaleTimeString()}
                       </td>
+                      <td>
+                        <button 
+                          className="history-button"
+                          onClick={() => fetchClientHistory(clientId)}
+                        >
+                          📜 View
+                        </button>
+                      </td>
                     </tr>
-                  ),
-                )}
+                  ))}
               </tbody>
             </table>
           </div>
         )}
       </div>
 
-      {/* Instructions Panel */}
-      <div style={styles.instructionsCard}>
-        <h3 style={styles.instructionsTitle}>💡 Quick Start Guide</h3>
-        <div style={styles.instructionsGrid}>
-          <div style={styles.instructionStep}>
-            <div style={styles.stepNumber}>1</div>
-            <div style={styles.stepContent}>
-              <strong>Start Server</strong>
-              <code style={styles.inlineCode}>python server/main.py</code>
+      {/* Round Participation History */}
+      <div className="table-card">
+        <h2 className="card-title">📋 Round Participation History</h2>
+        
+        {status.history && status.history.length > 0 ? (
+          <div className="table-wrapper">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Round</th>
+                  <th>Accuracy</th>
+                  <th>Selected Clients</th>
+                  <th>Submitted</th>
+                  <th>Timed Out</th>
+                  <th>Rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status.history.slice().reverse().map((h) => {
+                  const details = roundDetails[h.round] || {};
+                  const selected = details.selected_clients || h.selected || [];
+                  const submitted = details.submitted_clients || h.submitted || [];
+                  const timedOut = details.timed_out_clients || h.timed_out || [];
+                  const rate = (submitted.length / Math.max(selected.length, 1)) * 100;
+                  
+                  return (
+                    <tr key={h.round}>
+                      <td><span className="round-badge">Round {h.round}</span></td>
+                      <td><strong>{(h.accuracy * 100).toFixed(2)}%</strong></td>
+                      <td>
+                        <div className="client-list">
+                          {selected.map(cid => (
+                            <span key={cid} className="mini-badge">{cid}</span>
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="client-list">
+                          {submitted.map(cid => (
+                            <span key={cid} className="mini-badge success">{cid}</span>
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="client-list">
+                          {timedOut.map(cid => (
+                            <span key={cid} className="mini-badge danger">{cid}</span>
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <span className={`rate-badge ${rate === 100 ? 'perfect' : rate > 50 ? 'good' : 'low'}`}>
+                          {rate.toFixed(0)}%
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState message="No rounds completed yet" />
+        )}
+      </div>
+
+      {/* Client History Modal */}
+      {selectedClient && (
+        <div className="modal-overlay" onClick={() => setSelectedClient(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h3>Client {selectedClient} History</h3>
+            <button className="close-button" onClick={() => setSelectedClient(null)}>✕</button>
+            
+            <div className="history-timeline">
+              {clientHistory.length > 0 ? (
+                clientHistory.slice().reverse().map((event, idx) => (
+                  <div key={idx} className="timeline-event">
+                    <div className="event-time">{new Date(event.timestamp).toLocaleString()}</div>
+                    <div className="event-content">
+                      <strong>{event.event}</strong> - Round {event.round}
+                      {event.details && Object.keys(event.details).length > 0 && (
+                        <div className="event-details">
+                          {JSON.stringify(event.details)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p>No history available</p>
+              )}
             </div>
           </div>
-          <div style={styles.instructionStep}>
-            <div style={styles.stepNumber}>2</div>
-            <div style={styles.stepContent}>
-              <strong>Launch Clients</strong>
-              <code style={styles.inlineCode}>
-                python clients/client.py 1 --num-clients 10 --non-iid
-              </code>
-            </div>
-          </div>
-          <div style={styles.instructionStep}>
-            <div style={styles.stepNumber}>3</div>
-            <div style={styles.stepContent}>
-              <strong>Monitor Training</strong>
-              <span>Watch metrics update in real-time!</span>
-            </div>
-          </div>
+        </div>
+      )}
+
+      {/* Fault Tolerance Alert */}
+      {timedOutCount > 0 && (
+        <div className="alert-card">
+          <h3 className="alert-title">⚠️ Fault Tolerance Active</h3>
+          <p>
+            <strong>{timedOutCount} client(s)</strong> timed out. 
+            System continued with available updates.
+          </p>
+        </div>
+      )}
+
+      {/* System Info */}
+      <div className="footer">
+        <div className="footer-item">
+          <strong>Configuration:</strong> {config.connected_clients} clients connected, 
+          {' '}{(config.participation_prob * 100).toFixed(0)}% participation rate, 
+          {' '}{config.aggregation_timeout}s timeout
         </div>
       </div>
     </div>
   );
 }
 
-function StatCard({ title, value, color, icon, subtitle }) {
-  return (
-    <div style={{ ...styles.statCard, borderLeftColor: color }}>
-      <div style={styles.statIcon}>{icon}</div>
-      <div style={styles.statContent}>
-        <div style={styles.statTitle}>{title}</div>
-        <div style={{ ...styles.statValue, color }}>{value}</div>
-        {subtitle && <div style={styles.statSubtitle}>{subtitle}</div>}
-      </div>
-    </div>
-  );
+// Helper Functions
+function groupClientsByStatus(clients) {
+  const grouped = {};
+  Object.entries(clients).forEach(([clientId, info]) => {
+    const status = info.status || 'unknown';
+    if (!grouped[status]) {
+      grouped[status] = [];
+    }
+    grouped[status].push({ id: clientId, ...info });
+  });
+  return grouped;
 }
 
-function ChartCard({ title, children, color }) {
+// Components
+function StatCard({ title, value, color, icon }) {
   return (
-    <div style={styles.chartCard}>
-      <h2
-        style={{
-          ...styles.cardTitle,
-          borderLeftColor: color,
-          paddingLeft: "15px",
-        }}
-      >
-        {title}
-      </h2>
-      <div style={styles.chartContent}>{children}</div>
+    <div className="stat-card" style={{ borderLeftColor: color }}>
+      <div className="stat-icon">{icon}</div>
+      <div className="stat-content">
+        <div className="stat-title">{title}</div>
+        <div className="stat-value" style={{ color }}>{value}</div>
+      </div>
     </div>
   );
 }
 
 function StatusBadge({ status }) {
   const config = {
-    submitted: { color: "#4CAF50", label: "✓ Submitted" },
-    training: { color: "#FF9800", label: "⚙ Training" },
-    idle: { color: "#9E9E9E", label: "○ Idle" },
-    error: { color: "#F44336", label: "✗ Error" },
-  }[status] || { color: "#9E9E9E", label: status };
-
+    'submitted': { color: '#4CAF50', label: '✓ Submitted' },
+    'selected': { color: '#FF9800', label: '🎯 Selected' },
+    'waiting': { color: '#2196F3', label: '○ Waiting' },
+    'timed_out': { color: '#F44336', label: '✗ Timed Out' },
+    'training': { color: '#FF9800', label: '⚙ Training' }
+  }[status] || { color: '#9E9E9E', label: status };
+  
   return (
-    <span
-      style={{
-        backgroundColor: config.color,
-        color: "white",
-        padding: "4px 12px",
-        borderRadius: "12px",
-        fontSize: "12px",
-        fontWeight: "bold",
-      }}
-    >
+    <span className="status-badge" style={{ backgroundColor: config.color }}>
       {config.label}
     </span>
   );
 }
 
-function EmptyState({ message, icon = "📭" }) {
+function EmptyState({ message }) {
   return (
-    <div style={styles.emptyState}>
-      <div style={styles.emptyIcon}>{icon}</div>
+    <div className="empty-state">
+      <div className="empty-icon">📭</div>
       <p>{message}</p>
     </div>
   );
 }
-
-// ============================================================
-// STYLES - CSS in JavaScript
-// ============================================================
-
-const styles = {
-  container: {
-    padding: "20px",
-    fontFamily:
-      '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    backgroundColor: "#f5f7fa",
-    minHeight: "100vh",
-    maxWidth: "1400px",
-    margin: "0 auto",
-  },
-  header: {
-    background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-    padding: "30px",
-    borderRadius: "12px",
-    marginBottom: "30px",
-    boxShadow: "0 4px 6px rgba(0,0,0,0.1)",
-    color: "white",
-  },
-  title: {
-    margin: 0,
-    fontSize: "32px",
-    fontWeight: "700",
-    display: "flex",
-    alignItems: "center",
-    gap: "15px",
-  },
-  emoji: {
-    fontSize: "40px",
-  },
-  subtitle: {
-    fontSize: "16px",
-    opacity: 0.9,
-    marginTop: "10px",
-  },
-  lastUpdate: {
-    fontSize: "14px",
-    opacity: 0.8,
-    marginTop: "10px",
-  },
-  statsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))",
-    gap: "20px",
-    marginBottom: "30px",
-  },
-  statCard: {
-    backgroundColor: "white",
-    padding: "25px",
-    borderRadius: "12px",
-    boxShadow: "0 2px 4px rgba(0,0,0,0.08)",
-    borderLeft: "4px solid",
-    display: "flex",
-    alignItems: "center",
-    gap: "20px",
-    transition: "transform 0.2s, box-shadow 0.2s",
-    cursor: "default",
-  },
-  statIcon: {
-    fontSize: "40px",
-  },
-  statContent: {
-    flex: 1,
-  },
-  statTitle: {
-    fontSize: "14px",
-    color: "#666",
-    marginBottom: "5px",
-    textTransform: "uppercase",
-    letterSpacing: "0.5px",
-  },
-  statValue: {
-    fontSize: "32px",
-    fontWeight: "bold",
-    marginBottom: "5px",
-  },
-  statSubtitle: {
-    fontSize: "12px",
-    color: "#999",
-  },
-  chartsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(500px, 1fr))",
-    gap: "20px",
-    marginBottom: "30px",
-  },
-  chartCard: {
-    backgroundColor: "white",
-    padding: "20px",
-    borderRadius: "12px",
-    boxShadow: "0 2px 4px rgba(0,0,0,0.08)",
-  },
-  cardTitle: {
-    marginTop: 0,
-    color: "#333",
-    marginBottom: "20px",
-    fontSize: "18px",
-    fontWeight: "600",
-    borderLeft: "4px solid",
-    paddingLeft: "15px",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  badge: {
-    fontSize: "14px",
-    backgroundColor: "#e3f2fd",
-    color: "#2196F3",
-    padding: "4px 12px",
-    borderRadius: "12px",
-    fontWeight: "normal",
-  },
-  chartContent: {
-    minHeight: "300px",
-  },
-  tableCard: {
-    backgroundColor: "white",
-    padding: "20px",
-    borderRadius: "12px",
-    boxShadow: "0 2px 4px rgba(0,0,0,0.08)",
-    marginBottom: "30px",
-  },
-  tableWrapper: {
-    overflowX: "auto",
-  },
-  table: {
-    width: "100%",
-    borderCollapse: "collapse",
-  },
-  tableHeader: {
-    backgroundColor: "#f8f9fa",
-    textAlign: "left",
-  },
-  th: {
-    padding: "15px",
-    borderBottom: "2px solid #dee2e6",
-    fontWeight: "600",
-    color: "#495057",
-    fontSize: "14px",
-    textTransform: "uppercase",
-    letterSpacing: "0.5px",
-  },
-  tableRow: {
-    borderBottom: "1px solid #e9ecef",
-    transition: "background-color 0.2s",
-  },
-  td: {
-    padding: "15px",
-    fontSize: "14px",
-    color: "#495057",
-  },
-  clientBadge: {
-    color: "white",
-    padding: "6px 12px",
-    borderRadius: "6px",
-    fontSize: "13px",
-    fontWeight: "600",
-  },
-  roundBadge: {
-    backgroundColor: "#e3f2fd",
-    color: "#2196F3",
-    padding: "4px 10px",
-    borderRadius: "12px",
-    fontSize: "12px",
-    fontWeight: "600",
-  },
-  instructionsCard: {
-    backgroundColor: "#e3f2fd",
-    padding: "25px",
-    borderRadius: "12px",
-    borderLeft: "4px solid #2196F3",
-  },
-  instructionsTitle: {
-    marginTop: 0,
-    color: "#1976d2",
-    fontSize: "20px",
-    marginBottom: "20px",
-  },
-  instructionsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-    gap: "20px",
-  },
-  instructionStep: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: "15px",
-  },
-  stepNumber: {
-    backgroundColor: "#2196F3",
-    color: "white",
-    width: "32px",
-    height: "32px",
-    borderRadius: "50%",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: "bold",
-    flexShrink: 0,
-  },
-  stepContent: {
-    flex: 1,
-    display: "flex",
-    flexDirection: "column",
-    gap: "8px",
-  },
-  inlineCode: {
-    backgroundColor: "#fff",
-    padding: "4px 8px",
-    borderRadius: "4px",
-    fontSize: "13px",
-    fontFamily: "monospace",
-    color: "#1976d2",
-    display: "block",
-  },
-  emptyState: {
-    textAlign: "center",
-    padding: "60px 20px",
-    color: "#999",
-  },
-  emptyIcon: {
-    fontSize: "48px",
-    marginBottom: "15px",
-  },
-  loadingContainer: {
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "center",
-    alignItems: "center",
-    height: "100vh",
-    backgroundColor: "#f5f7fa",
-  },
-  spinner: {
-    fontSize: "64px",
-    marginBottom: "20px",
-    animation: "spin 2s linear infinite",
-  },
-  loadingText: {
-    fontSize: "24px",
-    color: "#666",
-  },
-  errorContainer: {
-    padding: "40px",
-    backgroundColor: "#ffebee",
-    color: "#c62828",
-    borderRadius: "12px",
-    margin: "40px",
-    maxWidth: "600px",
-  },
-  codeBlock: {
-    display: "block",
-    backgroundColor: "#fff",
-    padding: "15px",
-    marginTop: "15px",
-    color: "#000",
-    borderRadius: "6px",
-    fontFamily: "monospace",
-  },
-};
 
 export default App;

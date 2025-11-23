@@ -1,110 +1,119 @@
 # ============ IMPORTS ============
 import os
-import sys  # Path manipulation
-from datetime import datetime  # Timestamps
+import sys
+from datetime import datetime
 from math import ceil
-import random  # Random sampling
+import random
 
-import torch  # PyTorch for model evaluation
-from fastapi import FastAPI  # Web framework for building APIs
-from fastapi.middleware.cors import CORSMiddleware  # Allow cross-origin requests
-from pydantic import BaseModel  # Data validation
+import torch
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import threading
 import time
 
-# Add parent directory to Python path (for imports to work)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from server.aggregator import Aggregator  # Your partner's aggregation logic
+from server.aggregator import Aggregator
 
 # ============ SETUP FASTAPI ============
 app = FastAPI(title="Federated Learning Server", version="1.0.0")
 
-# Enable CORS - Allow React dashboard (localhost:3000) to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (fine for development)
-    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allow all headers
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
 # ============ GLOBAL STATE ============
-# These variables persist across HTTP requests
+agg = Aggregator()
+clients_status = {}  # Current status of each client
+client_history = {}  # Full history per client: {client_id: [events]}
+training_history = []  # Overall training metrics
+round_participation = {}  # Track who was selected and who participated per round
 
-agg = Aggregator()  # The aggregator (your partner's code)
-clients_status = {}  # Track active clients: {client_id: {status, timestamp, ...}}
-training_history = []  # Store metrics: [{round, accuracy, loss, ...}, ...]
-
-# Partial participation settings
-# p = probability a client is selected each round (server-side configured)
-# expected_selected = round(p * num_clients) can be used as a target, but server
-# will aggregate as soon as it receives updates from all selected clients OR when
-# at least MIN_UPDATES_TO_AGGREGATE are available.
+# Configuration
 PARTICIPATION_PROB = float(os.environ.get("FL_PARTICIPATION_PROB", 0.5))
-# Number of clients (default 3) can be overridden by environment variable
-NUM_CLIENTS = int(os.environ.get("FL_NUM_CLIENTS", 4))
-MIN_UPDATES_TO_AGGREGATE = 1  # safety lower bound
-UPDATES_PER_ROUND = max(MIN_UPDATES_TO_AGGREGATE, ceil(PARTICIPATION_PROB * NUM_CLIENTS))
-
-# Aggregation timeout (seconds) - after this many seconds since the first
-# submission for a round, the server will aggregate with whatever updates it
-# has received to tolerate dropped clients.
 AGGREGATION_TIMEOUT = float(os.environ.get("FL_AGG_TIMEOUT", 45.0))
+MIN_UPDATES_TO_AGGREGATE = 2
 
-# Track when the first submission for a round arrived: round -> timestamp
+# Track active clients dynamically
+connected_clients = set()
 first_submission_time = {}
-
-# Deterministic per-round selection storage: round_index -> set(client_id_str)
 selected_clients_by_round = {}
-# Track which clients have already submitted for a given round: round_index -> set(client_id_str)
 submitted_clients_by_round = {}
+aggregation_in_progress = False  # Prevent double aggregation
 
-# Adaptive participation tuning parameters
-# If recent accuracy improvement over P_ADJUST_WINDOW rounds is < P_IMPROVE_MIN,
-# increase PARTICIPATION_PROB by P_INCREMENT (once per round at most).
+# Adaptive participation
 P_ADJUST_WINDOW = 5
 P_IMPROVE_MIN = 1e-3
 P_INCREMENT = 0.1
 last_p_adjust_round = -1
 
 
-def update_updates_per_round():
-    """Update UPDATES_PER_ROUND from PARTICIPATION_PROB and NUM_CLIENTS."""
-    global UPDATES_PER_ROUND
-    UPDATES_PER_ROUND = max(MIN_UPDATES_TO_AGGREGATE, ceil(PARTICIPATION_PROB * NUM_CLIENTS))
+def get_num_clients():
+    """Get number of connected clients dynamically"""
+    return len(connected_clients) if len(connected_clients) > 0 else MIN_UPDATES_TO_AGGREGATE
+
+
+def get_updates_per_round():
+    """Calculate target updates based on connected clients"""
+    num_clients = get_num_clients()
+    target = max(MIN_UPDATES_TO_AGGREGATE, ceil(PARTICIPATION_PROB * num_clients))
+    return min(target, num_clients)
+
+
+def add_to_client_history(client_id, event_type, details=None):
+    """Add event to client's history"""
+    if client_id not in client_history:
+        client_history[client_id] = []
+    
+    event = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event_type,
+        "round": agg.current_round,
+        "details": details or {}
+    }
+    client_history[client_id].append(event)
 
 
 def select_participants_for_round(round_idx: int):
-    """Select and persist a deterministic participant set for the given round.
-
-    Selection draws k = round(PARTICIPATION_PROB * NUM_CLIENTS) unique client ids
-    from the range [0, NUM_CLIENTS). Returned client ids are strings to match
-    client_id usage elsewhere.
-    """
+    """Select participants from connected clients"""
     if round_idx in selected_clients_by_round:
         return selected_clients_by_round[round_idx]
 
-    # Select exactly the target number of updates per round (bounded by NUM_CLIENTS)
-    k = max(1, min(UPDATES_PER_ROUND, NUM_CLIENTS))
-    sampled = set(str(x) for x in random.sample(range(NUM_CLIENTS), k))
+    if len(connected_clients) == 0:
+        return set()
+
+    num_clients = len(connected_clients)
+    k = max(1, min(get_updates_per_round(), num_clients))
+    
+    sampled = set(random.sample(list(connected_clients), k))
     selected_clients_by_round[round_idx] = sampled
-    first_submission_time.setdefault(round_idx, time.time()) # Record when this participant set was chosen so timeout can be started
+    first_submission_time.setdefault(round_idx, time.time())
+    
+    # Initialize round participation tracking
+    round_participation[round_idx] = {
+        "selected": list(sampled),
+        "submitted": [],
+        "timed_out": [],
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    # Add selection to history for selected clients
+    for client_id in sampled:
+        add_to_client_history(client_id, "selected", {"round": round_idx})
+    
     print(f"[SERVER] Selected {len(sampled)} participants for round {round_idx}: {sorted(list(sampled))}")
     return sampled
 
 
 def adjust_participation():
-    """Increase PARTICIPATION_PROB when convergence stalls over recent rounds.
-
-    Simple heuristic: if improvement over the last P_ADJUST_WINDOW rounds is less
-    than P_IMPROVE_MIN, bump PARTICIPATION_PROB by P_INCREMENT (capped at 1.0)
-    and recompute UPDATES_PER_ROUND. Only adjust once per round.
-    """
+    """Increase PARTICIPATION_PROB when convergence stalls"""
     global PARTICIPATION_PROB, last_p_adjust_round
     current = agg.current_round
-    if current <= 0:
-        return
-    if last_p_adjust_round >= current:
+    
+    if current <= 0 or last_p_adjust_round >= current:
         return
     if len(training_history) < P_ADJUST_WINDOW:
         return
@@ -113,175 +122,163 @@ def adjust_participation():
     first_acc = recent[0]["accuracy"]
     last_acc = recent[-1]["accuracy"]
     improvement = last_acc - first_acc
+    
     if improvement < P_IMPROVE_MIN and PARTICIPATION_PROB < 1.0:
         PARTICIPATION_PROB = min(1.0, PARTICIPATION_PROB + P_INCREMENT)
-        update_updates_per_round()
         last_p_adjust_round = current
-        print(f"[SERVER] ↑ Participation increased to {PARTICIPATION_PROB:.2f}; target updates {UPDATES_PER_ROUND}")
+        print(f"[SERVER] ↑ Participation increased to {PARTICIPATION_PROB:.2f}")
+
+
+def perform_aggregation(round_num, trigger="normal"):
+    """Perform aggregation and prevent duplicates"""
+    global aggregation_in_progress
+    
+    if aggregation_in_progress:
+        print(f"[SERVER] Aggregation already in progress, skipping")
+        return False
+    
+    aggregation_in_progress = True
+    
+    try:
+        print(f"[SERVER] 🔄 Aggregating round {round_num}... (trigger: {trigger})")
+        agg.aggregate()
+        
+        finished_round = agg.current_round - 1
+        
+        # Update round participation tracking
+        if round_num in round_participation:
+            submitted_set = submitted_clients_by_round.get(round_num, set())
+            round_participation[round_num]["submitted"] = list(submitted_set)
+        
+        # Cleanup
+        if finished_round in submitted_clients_by_round:
+            del submitted_clients_by_round[finished_round]
+        if finished_round in first_submission_time:
+            del first_submission_time[finished_round]
+
+        try:
+            adjust_participation()
+        except Exception as e:
+            print(f"[SERVER] Participation adjustment failed: {e}")
+
+        accuracy, loss = evaluate_model()
+        
+        # Get participation stats for this round
+        participated = round_participation.get(finished_round, {})
+        
+        training_history.append({
+            "round": finished_round,
+            "accuracy": accuracy,
+            "loss": loss,
+            "timestamp": datetime.now().isoformat(),
+            "num_updates": agg.last_num_updates,
+            "selected": participated.get("selected", []),
+            "submitted": participated.get("submitted", []),
+            "timed_out": participated.get("timed_out", [])
+        })
+
+        print(f"[SERVER] ✅ Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}")
+        
+        return True
+        
+    finally:
+        aggregation_in_progress = False
 
 
 # ============ DATA VALIDATION ============
 class UpdateRequest(BaseModel):
-    """Validate client update format"""
-
     client_id: str
-    weights: dict  # Model weights as nested dict
-    data_size: int  # Number of samples client trained on
+    weights: dict
+    data_size: int
+
 
 # ============ API ENDPOINTS ============
 
-
 @app.get("/")
 def root():
-    """
-    Health check - Confirm server is running
-
-    WHEN CALLED: Browser visits http://127.0.0.1:9000
-    RETURNS: JSON with server status
-    """
     return {
         "status": "Federated Learning Server Running",
         "round": agg.current_round,
-        "clients_seen": len(clients_status),
+        "connected_clients": len(connected_clients),
         "pending_updates": len(agg.updates),
     }
 
 
 @app.get("/get_model")
 def get_model():
-    """
-    Clients download the global model
-
-    WHEN CALLED: Client runs requests.get(f"{SERVER_URL}/get_model")
-    WHAT IT DOES: Returns current global model weights
-    RETURNS: {"round": 5, "weights": {...}}
-
-    DISTRIBUTED CONCEPT: Model Synchronization
-    All clients get same starting point each round
-    """
     return {
         "round": agg.current_round,
-        "weights": agg.get_weights(),  # Convert tensors → lists
+        "weights": agg.get_weights(),
     }
 
 
 @app.get("/should_participate")
 def should_participate(client_id: str):
-    """
-    Clients can call this endpoint to check whether they were randomly selected
-    to participate in the current round. Server uses PARTICIPATION_PROB to
-    select clients per round.
-
-    Returns: {selected: bool, round: int}
-    """
-
-    # Use deterministic per-round selection: server picks participants once per
-    # round and records them in `selected_clients_by_round`.
+    """Check if client should participate and mark as connected"""
+    connected_clients.add(client_id)
+    
+    # Check if selected for current round
     selected_set = select_participants_for_round(agg.current_round)
     selected = str(client_id) in selected_set
+    
+    # Update status
+    if selected:
+        clients_status[client_id] = {
+            "status": "selected",
+            "timestamp": datetime.now().isoformat(),
+            "round": agg.current_round,
+        }
+        add_to_client_history(client_id, "waiting_to_train", {"round": agg.current_round})
+    else:
+        clients_status[client_id] = {
+            "status": "waiting",
+            "timestamp": datetime.now().isoformat(),
+            "round": agg.current_round,
+        }
+    
     return {"selected": selected, "round": agg.current_round}
 
 
 @app.post("/submit_update")
 def submit_update(upd: UpdateRequest):
-    """
-    Clients submit trained model updates
-
-    WHEN CALLED: Client runs requests.post(f"{SERVER_URL}/submit_update", json={...})
-    WHAT IT DOES:
-    1. Store client's update
-    2. Track client activity
-    3. If 3 updates received → aggregate them
-    4. Evaluate new model accuracy
-    5. Store metrics for dashboard
-
-    RETURNS: {"status": "received", "round": 5, ...}
-
-    DISTRIBUTED CONCEPT: Asynchronous Aggregation
-    Clients submit independently, server aggregates when ready
-    """
-    # Ensure we only accept one submission per client per round. If client
-    # submits for a stale round (client thinks it's round N but server is at M>N)
-    # or if client already submitted for the current round, reject the submission
     current_round = agg.current_round
     submitted_set = submitted_clients_by_round.get(current_round, set())
+    
+    connected_clients.add(upd.client_id)
+    
     if upd.client_id in submitted_set:
-        print(f"[SERVER] ✗ Duplicate submission from client {upd.client_id} for round {current_round} - rejecting")
+        print(f"[SERVER] ✗ Duplicate submission from client {upd.client_id} - rejecting")
         return {"status": "duplicate", "round": current_round}
 
-    # Accept and store update
     agg.receive_update(upd.weights, upd.data_size)
     submitted_set.add(upd.client_id)
     submitted_clients_by_round[current_round] = submitted_set
 
-    # Track this client (for dashboard)
-    client_id = upd.client_id
-    clients_status[client_id] = {
+    # Update status and history
+    clients_status[upd.client_id] = {
         "status": "submitted",
         "timestamp": datetime.now().isoformat(),
         "data_size": upd.data_size,
-        "round": agg.current_round,
+        "round": current_round,
     }
+    
+    add_to_client_history(upd.client_id, "submitted", {
+        "round": current_round,
+        "data_size": upd.data_size
+    })
 
-    print(
-        f"[SERVER] ✓ Client {client_id} submitted for round {current_round}. Updates: {len(agg.updates)}/{UPDATES_PER_ROUND}"
-    )
+    updates_needed = get_updates_per_round()
+    print(f"[SERVER] ✓ Client {upd.client_id} submitted. Updates: {len(agg.updates)}/{updates_needed}")
 
-    # Check if ready to aggregate
-    if len(agg.updates) >= UPDATES_PER_ROUND:
-        # Log the round we're about to aggregate (current round)
-        print(f"[SERVER] 🔄 Aggregating round {agg.current_round}...")
-
-        # Perform Federated Averaging (your partner's code)
-        agg.aggregate()
-
-        # After successful aggregation the aggregator increments agg.current_round.
-        # The 'finished' round is therefore agg.current_round - 1.
-        finished_round = agg.current_round - 1
-
-        # Clear submitted set for the finished round (they've been processed).
-        if finished_round in submitted_clients_by_round:
-            try:
-                del submitted_clients_by_round[finished_round]
-            except KeyError:
-                pass
-        # Clean up selection/submission timestamp for finished round
-        if finished_round in first_submission_time:
-            try:
-                del first_submission_time[finished_round]
-            except KeyError:
-                pass
-
-        # Optionally adjust participation probability based on recent progress
-        try:
-            adjust_participation()
-        except Exception as e:
-            print(f"[SERVER] Participation adjustment failed: {e}")
-
-        # Test the new model
-        accuracy, loss = evaluate_model()
-
-        # Store metrics for dashboard using the finished round number for clarity
-        training_history.append(
-            {
-                "round": finished_round,
-                "accuracy": accuracy,
-                "loss": loss,
-                "timestamp": datetime.now().isoformat(),
+    if len(agg.updates) >= updates_needed:
+        success = perform_aggregation(current_round, trigger="sufficient_updates")
+        
+        if success:
+            return {
+                "status": "aggregated",
+                "round": agg.current_round,
             }
-        )
 
-        print(
-            f"[SERVER] ✅ Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}"
-        )
-
-        return {
-            "status": "aggregated",
-            "round": agg.current_round,
-            "accuracy": accuracy,
-        }
-
-    # Not enough updates yet
     return {
         "status": "received",
         "round": agg.current_round,
@@ -291,195 +288,159 @@ def submit_update(upd: UpdateRequest):
 
 @app.get("/status")
 def get_status():
-    """
-    Dashboard gets system status
-
-    WHEN CALLED: Dashboard runs fetch('http://127.0.0.1:9000/status')
-    WHAT IT DOES: Return snapshot of entire system state
-    RETURNS: {current_round, active_clients, clients: {...}, history: [...]}
-
-    USED BY: Dashboard to show real-time metrics
-    """
+    """Return status for connected clients only"""
     return {
         "current_round": agg.current_round,
-        "active_clients": len(clients_status),
+        "active_clients": len([c for c in clients_status.values() if c.get("status") in ["submitted", "selected", "waiting"]]),
         "pending_updates": len(agg.updates),
         "clients": clients_status,
-        "history": training_history[-20:],  # Last 20 rounds
+        "history": training_history[-20:],
+        "connected_clients": list(connected_clients),
+        "aggregation_in_progress": aggregation_in_progress,
     }
 
 
 @app.get("/metrics")
 def get_metrics():
-    """
-    Dashboard gets training metrics for charts
-
-    WHEN CALLED: Dashboard runs fetch('http://127.0.0.1:9000/metrics')
-    WHAT IT DOES: Return data formatted for charts
-    RETURNS: {rounds: [...], accuracy: [...], loss: [...]}
-
-    USED BY: Dashboard to plot accuracy/loss over time
-    """
+    """Return training metrics - only updated after aggregation"""
     return {
         "round": agg.current_round,
         "rounds": [h["round"] for h in training_history],
         "accuracy": [h["accuracy"] for h in training_history],
         "loss": [h["loss"] for h in training_history],
+        "last_updated": training_history[-1]["timestamp"] if training_history else None
     }
+
+
+@app.get("/client_history/{client_id}")
+def get_client_history(client_id: str):
+    """Get full history for a specific client"""
+    return {
+        "client_id": client_id,
+        "history": client_history.get(client_id, []),
+        "current_status": clients_status.get(client_id, {}),
+        "total_events": len(client_history.get(client_id, []))
+    }
+
+
+@app.get("/round_details/{round_num}")
+def get_round_details(round_num: int):
+    """Get detailed information about a specific round"""
+    round_data = next((h for h in training_history if h["round"] == round_num), None)
+    participation = round_participation.get(round_num, {})
+    
+    if round_data:
+        return {
+            "round": round_num,
+            "accuracy": round_data["accuracy"],
+            "loss": round_data["loss"],
+            "timestamp": round_data["timestamp"],
+            "selected_clients": participation.get("selected", []),
+            "submitted_clients": participation.get("submitted", []),
+            "timed_out_clients": participation.get("timed_out", []),
+            "participation_rate": len(participation.get("submitted", [])) / max(len(participation.get("selected", [])), 1)
+        }
+    
+    return {"error": "Round not found"}
 
 
 @app.get("/config")
 def get_config():
-    """Return server-side configuration useful for clients."""
+    """Return dynamic configuration"""
+    num_clients = get_num_clients()
+    updates_per_round = get_updates_per_round()
+    
     return {
-        "num_clients": NUM_CLIENTS,
+        "num_clients": num_clients,
         "participation_prob": PARTICIPATION_PROB,
-        "updates_per_round": UPDATES_PER_ROUND,
+        "updates_per_round": updates_per_round,
         "aggregation_timeout": AGGREGATION_TIMEOUT,
         "current_round": agg.current_round,
+        "connected_clients": len(connected_clients),
     }
 
 
-# Background monitor: checks if the current round has been waiting too long
-# after the first submission and forces aggregation with available updates.
+# Background monitor for timeouts
 def _aggregation_monitor():
     while True:
         try:
             current = agg.current_round
             start_ts = first_submission_time.get(current, None)
-            # If we have a start time and enough time has passed, trigger aggregation
-            if start_ts is not None:
+            
+            if start_ts is not None and not aggregation_in_progress:
                 elapsed = time.time() - start_ts
                 if elapsed >= AGGREGATION_TIMEOUT:
-                    # Snapshot whether we have updates before attempting aggregation.
                     had_updates = len(agg.updates) > 0
-                    if had_updates:
-                        print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; aggregating {len(agg.updates)} updates")
-                    else:
-                        print(f"[SERVER] Aggregation timeout ({AGGREGATION_TIMEOUT}s) reached for round {current}; no updates received -> advancing round")
-                    # mark selected-but-not-submitted clients as timed_out for diagnostics
+                    
+                    # Mark missing clients as timed_out
                     selected = selected_clients_by_round.get(current, set())
                     submitted = submitted_clients_by_round.get(current, set())
                     missing = selected - submitted
+                    
                     for cid in missing:
                         clients_status[cid] = {
                             "status": "timed_out",
                             "timestamp": datetime.now().isoformat(),
                             "round": current,
                         }
+                        add_to_client_history(cid, "timed_out", {"round": current})
+                    
+                    # Update round participation
+                    if current in round_participation:
+                        round_participation[current]["timed_out"] = list(missing)
 
-
-                    # Force aggregation using whatever updates we've got (if any)
-                    try:
-                        if had_updates:
-                            agg.aggregate()
-                        else:
-                            # No updates: explicitly advance the round so server liveness
-                            # is preserved. We skip model evaluation for empty rounds.
-                            agg.current_round += 1
-                    except Exception as e:
-                        print(f"[SERVER] Forced aggregation/advance failed: {e}")
-
-                    # cleanup bookkeeping for finished round
-                    finished_round = agg.current_round - 1
-                    if finished_round in submitted_clients_by_round:
-                        try:
-                            del submitted_clients_by_round[finished_round]
-                        except KeyError:
-                            pass
-                    if finished_round in first_submission_time:
-                        try:
-                            del first_submission_time[finished_round]
-                        except KeyError:
-                            pass
-
-                    # Evaluate and record metrics only when we actually aggregated updates
-                    if not had_updates:
-                        # Empty round - record that it completed with no updates
-                        print(f"[SERVER] (timeout) Round {finished_round} advanced with NO updates")
+                    if had_updates:
+                        print(f"[SERVER] Timeout ({AGGREGATION_TIMEOUT}s) - aggregating {len(agg.updates)} updates")
+                        perform_aggregation(current, trigger="timeout")
                     else:
-                        try:
-                            accuracy, loss = evaluate_model()
-                            training_history.append(
-                                {
-                                    "round": finished_round,
-                                    "accuracy": accuracy,
-                                    "loss": loss,
-                                    "timestamp": datetime.now().isoformat(),
-                                }
-                            )
-                            print(f"[SERVER] \u2705 (timeout) Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}")
-                        except Exception as e:
-                            print(f"[SERVER] Post-aggregation evaluation failed: {e}")
+                        print(f"[SERVER] Timeout with no updates - advancing round")
+                        agg.current_round += 1
+                        
+                        # Cleanup
+                        if current in submitted_clients_by_round:
+                            del submitted_clients_by_round[current]
+                        if current in first_submission_time:
+                            del first_submission_time[current]
 
-            # Sleep briefly between checks
             time.sleep(1.0)
         except Exception as e:
-            print(f"[SERVER] Aggregation monitor error: {e}")
+            print(f"[SERVER] Monitor error: {e}")
             time.sleep(1.0)
 
 
-# Start monitor thread as daemon so it doesn't block shutdown
 monitor_thread = threading.Thread(target=_aggregation_monitor, daemon=True)
 monitor_thread.start()
 
 
 # ============ HELPER FUNCTIONS ============
 
-
 def evaluate_model():
-    """
-    Test global model on test dataset
-
-    WHAT IT DOES:
-    1. Load MNIST test set (10,000 images model hasn't seen)
-    2. Run predictions on all images
-    3. Calculate accuracy (% correct)
-    4. Calculate loss (how confident/wrong predictions are)
-
-    RETURNS: (accuracy, loss)
-
-    WHY IMPORTANT: This tells us if model is actually learning!
-
-    DISTRIBUTED CONCEPT: Centralized Evaluation
-    Server evaluates on test set to measure global model quality
-    """
+    """Evaluate global model on test set"""
     import torch.nn.functional as F
-
     from clients.data_utils import get_dataloader
 
-    # Load test data
     _, test_loader = get_dataloader(batch_size=128)
-
-    # Get model and set to evaluation mode
     model = agg.global_model
-    model.eval()  # Disable dropout, batch norm
+    model.eval()
 
     correct = 0
     total = 0
     total_loss = 0.0
     num_batches = 0
 
-    # Test on all images
-    with torch.no_grad():  # Don't compute gradients (faster)
+    with torch.no_grad():
         for images, labels in test_loader:
             outputs = model(images)
-
-            # Calculate loss
             loss = F.cross_entropy(outputs, labels)
             total_loss += loss.item()
             num_batches += 1
-
-            # Get predictions
+            
             _, predicted = torch.max(outputs.data, 1)
-
-            # Count correct
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
     accuracy = correct / total
     avg_loss = total_loss / num_batches
-
     return accuracy, avg_loss
 
 
@@ -491,8 +452,11 @@ if __name__ == "__main__":
     print("🚀 FEDERATED LEARNING SERVER")
     print("=" * 70)
     print(f"📍 Server:    http://127.0.0.1:9000")
-    print(f"📊 API Docs:  http://127.0.0.1:9000/docs")
-    print(f"⚙️  Aggregation: Every {UPDATES_PER_ROUND} client updates")
+    print(f"⚙️  Min Updates: {MIN_UPDATES_TO_AGGREGATE}")
+    print(f"⚙️  Participation: {PARTICIPATION_PROB * 100:.0f}%")
+    print(f"⚙️  Timeout: {AGGREGATION_TIMEOUT}s")
+    print("=" * 70)
+    print("📱 Dynamic client tracking with history")
     print("=" * 70)
 
     uvicorn.run(app, host="0.0.0.0", port=9000)
