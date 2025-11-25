@@ -190,6 +190,8 @@ class UpdateRequest(BaseModel):
     client_id: str
     weights: dict
     data_size: int
+    # client-provided round id to prevent stale updates
+    round: int
 
 
 # ============ API ENDPOINTS ============
@@ -241,16 +243,32 @@ def should_participate(client_id: str):
 
 @app.post("/submit_update")
 def submit_update(upd: UpdateRequest):
+    # Receive a client update and validate the client-provided round id.
     current_round = agg.current_round
+
+    if upd.round != current_round:
+        print(f"[SERVER] ✗ Stale/future submission from client {upd.client_id} (client_round={upd.round}, server_round={current_round}) - rejecting")
+        # HTTP 409 Conflict is appropriate for stale submissions; return descriptive body
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail={"status": "stale_round", "client_round": upd.round, "server_round": current_round})
+
+    # Now proceed with the normal submission for the current round
     submitted_set = submitted_clients_by_round.get(current_round, set())
-    
+
     connected_clients.add(upd.client_id)
-    
+
     if upd.client_id in submitted_set:
         print(f"[SERVER] ✗ Duplicate submission from client {upd.client_id} - rejecting")
         return {"status": "duplicate", "round": current_round}
 
-    agg.receive_update(upd.weights, upd.data_size)
+    # Accept update
+    try:
+        agg.receive_update(upd.weights, upd.data_size)
+    except Exception as e:
+        print(f"[SERVER] ✗ Failed to process update from {upd.client_id}: {e}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail={"status": "invalid_update", "error": str(e)})
+
     submitted_set.add(upd.client_id)
     submitted_clients_by_round[current_round] = submitted_set
 
@@ -261,7 +279,7 @@ def submit_update(upd: UpdateRequest):
         "data_size": upd.data_size,
         "round": current_round,
     }
-    
+
     add_to_client_history(upd.client_id, "submitted", {
         "round": current_round,
         "data_size": upd.data_size
@@ -272,7 +290,7 @@ def submit_update(upd: UpdateRequest):
 
     if len(agg.updates) >= updates_needed:
         success = perform_aggregation(current_round, trigger="sufficient_updates")
-        
+
         if success:
             return {
                 "status": "aggregated",
